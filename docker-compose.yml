@@ -1,0 +1,20 @@
+services:
+  mcp:
+    image: ghcr.io/samrocksc/personal-honcho-mcp:latest
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      HONCHO_API_URL: http://api:8000 # your honcho api service name
+      HONCHO_API_KEY: "" # empty = keyless self-host mode
+      HONCHO_WORKSPACE_ID: default
+      HONCHO_USER_PEER_ID: user
+      HONCHO_AI_PEER_ID: assistant
+      #HONCHO_REASONING_LEVEL: medium
+      HONCHO_TIMEOUT_MS: "300000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
