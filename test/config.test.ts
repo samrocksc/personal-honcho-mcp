@@ -6,17 +6,14 @@ import {
   parseReasoningLevel,
   resolveWorkspaceId,
   createClientFactory,
-  missingIdentityMessage,
 } from "../src/config.js";
-import { resolveAiPeerId, resolveUserPeerId } from "../src/identity.js";
-import type { ToolContext } from "../src/types.js";
 
 test("parseEnvConfig: all values from env", () => {
   const config = parseEnvConfig({
     HONCHO_API_KEY: "  hch-test  ",
     HONCHO_API_URL: " http://localhost:8000 ",
     HONCHO_WORKSPACE_ID: " my-workspace ",
-    HONCHO_USER_PEER_ID: " sam ",
+    HONCHO_USER_PEER_ID: " alice ",
     HONCHO_AI_PEER_ID: " assistant ",
     HONCHO_REASONING_LEVEL: "HIGH",
     HONCHO_TIMEOUT_MS: "5000",
@@ -24,7 +21,7 @@ test("parseEnvConfig: all values from env", () => {
   assert.equal(config.apiKey, "hch-test");
   assert.equal(config.baseUrl, "http://localhost:8000");
   assert.equal(config.workspaceId, "my-workspace");
-  assert.equal(config.userPeerId, "sam");
+  assert.equal(config.userPeerId, "alice");
   assert.equal(config.aiPeerId, "assistant");
   assert.equal(config.reasoningLevel, "high");
   assert.equal(config.timeoutMs, 5000);
@@ -75,33 +72,14 @@ test("resolveWorkspaceId: argument beats env default; error when unresolvable", 
   );
 });
 
-test("resolveUserPeerId / resolveAiPeerId: overrides and defaults", () => {
-  const ctx = {
-    config: parseEnvConfig({
-      HONCHO_USER_PEER_ID: "sam",
-      HONCHO_AI_PEER_ID: "assistant",
-    }),
-  } as unknown as ToolContext;
-
-  assert.equal(resolveUserPeerId(ctx, " alt "), "alt");
-  assert.equal(resolveUserPeerId(ctx), "sam");
-  assert.equal(resolveAiPeerId(ctx, "alt-peer"), "alt-peer");
-  assert.equal(resolveAiPeerId(ctx), "assistant");
-
-  const bare = { config: parseEnvConfig({}) } as unknown as ToolContext;
-  assert.throws(() => resolveUserPeerId(bare), /HONCHO_USER_PEER_ID/);
-  assert.throws(() => resolveAiPeerId(bare), /HONCHO_AI_PEER_ID/);
-  assert.match(missingIdentityMessage("ai peer"), /HONCHO_AI_PEER_ID/);
-});
-
-test("createClientFactory: throws without workspace, caches per workspace", () => {
+test("createClientFactory: resolve throws without workspace; get caches per workspace", () => {
   const config = parseEnvConfig({ HONCHO_WORKSPACE_ID: "my-workspace" });
   const factory = createClientFactory(config);
-  const a = factory();
-  const b = factory("my-workspace");
+  const a = factory.get("my-workspace");
+  const b = factory.get("my-workspace");
   assert.equal(a, b);
-  const c = factory("other");
+  const c = factory.get("other");
   assert.notEqual(a, c);
   const bare = createClientFactory(parseEnvConfig({}));
-  assert.throws(() => bare(), /Missing workspace_id/);
+  assert.throws(() => bare.resolve(), /Missing workspace_id/);
 });

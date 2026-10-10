@@ -1,29 +1,20 @@
 import { z } from "zod";
 import type {
   Conclusion,
-  Honcho,
   Message,
   Summary,
   SessionSummaries,
 } from "@honcho-ai/sdk";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { HonchoConfig } from "./config.js";
-import { resolveWorkspaceId } from "./config.js";
-
-export interface ToolContext {
-  config: HonchoConfig;
-  /** Return a Honcho client scoped to the given workspace (or the default). */
-  clientFor: (workspaceId?: string) => Honcho;
-  /** Client used only for credential-scoped ops (list/create workspaces). */
-  unscoped: Honcho;
-}
+import type { ToolDeps } from "./deps.js";
 
 /**
  * Always optional at the schema layer so a missing value reaches
- * resolveWorkspaceId, which returns a clear error when unresolvable.
+ * honchoFor, which fails with a clear MissingWorkspaceError when unresolvable.
  */
-export function workspaceIdSchema(ctx: ToolContext) {
-  const fromEnv = ctx.config.workspaceId;
+export function workspaceIdSchema(deps?: { config: HonchoConfig }) {
+  const fromEnv = deps?.config.workspaceId;
   const description = fromEnv
     ? `Workspace to operate in. The server defaulted to HONCHO_WORKSPACE_ID=${fromEnv}; omit this argument unless you need a different workspace.`
     : "Workspace to operate in. Omit if the server set HONCHO_WORKSPACE_ID; otherwise pass it on every call.";
@@ -42,9 +33,7 @@ export function errorResult(msg: string): CallToolResult {
   return { content: [{ type: "text", text: msg }], isError: true };
 }
 
-export function errorMessage(prefix: string, e: unknown): string {
-  return `${prefix}: ${e instanceof Error ? e.message : String(e)}`;
-}
+export type { ToolDeps };
 
 /** Serialize a Message to a plain JSON-safe object. */
 export function formatMessage(message: Message) {

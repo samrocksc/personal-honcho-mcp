@@ -1,18 +1,16 @@
 import { createServer as createHttpServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
+import { Effect } from "effect";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import {
-  parseEnvConfig,
-  createClientFactory,
-  createUnscopedClient,
-  type HonchoConfig,
-} from "./config.js";
+import { parseEnvConfig, type HonchoConfig } from "./config.js";
+import { makeToolDeps } from "./honcho.js";
 import { createServer as createMcpServer } from "./server.js";
 import { loadDotenv } from "./dotenv.js";
 
+// .env first (never overrides real env vars), then the program.
 loadDotenv();
 
 const CORS_ORIGIN = "*";
@@ -201,14 +199,11 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse) {
     );
   }
 
-  // New session: build a config-scoped server + transport.
+  // New session: build a config-scoped runtime + server.
   enforceSessionMax();
   const config = configForRequest(req);
-  const mcp = createMcpServer({
-    config,
-    clientFor: createClientFactory(config),
-    unscoped: createUnscopedClient(config),
-  });
+  const deps = makeToolDeps(config);
+  const mcp = createMcpServer(deps);
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => randomUUID(),
     enableJsonResponse: true,
@@ -228,8 +223,24 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse) {
   await transport.handleRequest(req, res, body);
 }
 
-export function main(): void {
-  const port = envInt("PORT", 3000);
+export function startHttpServer(): void {
+  // Effect bootstrap: environment → config → runtime → server lifecycle.
+  const bootstrap = Effect.gen(function* () {
+    const config = parseEnvConfig(process.env);
+    const deps = makeToolDeps(config);
+    yield* Effect.sync(() => buildAndListen(deps.config));
+    return config;
+  });
+
+  Effect.runPromise(bootstrap).catch((e) => {
+    console.error(e instanceof Error ? e.message : String(e));
+    process.exit(1);
+  });
+}
+
+function buildAndListen(config: HonchoConfig): void {
+  const port = Number(process.env.PORT);
+  const resolvedPort = Number.isFinite(port) && port > 0 ? port : 3000;
   const host = process.env.HOST?.trim() || "0.0.0.0";
 
   const httpServer = createHttpServer((req, res) => {
@@ -264,13 +275,14 @@ export function main(): void {
     jsonResponse(res, { error: "Not found" }, 404);
   });
 
-  httpServer.listen(port, host, () => {
-    console.error(`personal-honcho-mcp listening on http://${host}:${port}`);
+  httpServer.listen(resolvedPort, host, () => {
+    console.error(`personal-honcho-mcp listening on http://${host}:${resolvedPort}`);
     console.error(
-      `  honcho: ${process.env.HONCHO_API_URL?.trim() || "https://api.honcho.dev"}` +
-        ` (workspace: ${process.env.HONCHO_WORKSPACE_ID?.trim() || "unset"})` +
-        ` (user: ${process.env.HONCHO_USER_PEER_ID?.trim() || "unset"})` +
-        ` (ai peer: ${process.env.HONCHO_AI_PEER_ID?.trim() || "unset"})`,
+      `  honcho: ${config.baseUrl}` +
+        ` (workspace: ${config.workspaceId ?? "unset"})` +
+        ` (user: ${config.userPeerId ?? "unset"})` +
+        ` (ai peer: ${config.aiPeerId ?? "unset"})` +
+        ` (auth: ${config.apiKey ? "key" : "keyless"})`,
     );
   });
 
@@ -283,4 +295,4 @@ export function main(): void {
   process.on("SIGTERM", shutdown);
 }
 
-main();
+startHttpServer();

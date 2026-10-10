@@ -1,5 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { ToolContext } from "./types.js";
+import type { ToolDeps } from "./deps.js";
 import { register as registerWorkspaceTools } from "./tools/workspace.js";
 import { register as registerPeerTools } from "./tools/peers.js";
 import { register as registerSessionTools } from "./tools/sessions.js";
@@ -33,23 +33,23 @@ const INSTRUCTIONS = [
   "- schedule_dream after heavy message writing to consolidate memory.",
 ].join("\n");
 
-export function createServer(ctx: ToolContext): McpServer {
+export function createServer(deps: ToolDeps): McpServer {
   const server = new McpServer(
     {
       name: "personal-honcho-mcp",
-      version: "1.0.0",
+      version: "2.0.0",
     },
     { instructions: INSTRUCTIONS },
   );
 
-  registerWorkspaceTools(server, ctx);
-  registerPeerTools(server, ctx);
-  registerSessionTools(server, ctx);
-  registerScopeTools(server, ctx);
-  registerConclusionTools(server, ctx);
-  registerSystemTools(server, ctx);
-  registerIdentityTools(server, ctx);
-  registerMyConclusionTools(server, ctx);
+  registerWorkspaceTools(server, deps);
+  registerPeerTools(server, deps);
+  registerSessionTools(server, deps);
+  registerScopeTools(server, deps);
+  registerConclusionTools(server, deps);
+  registerSystemTools(server, deps);
+  registerIdentityTools(server, deps);
+  registerMyConclusionTools(server, deps);
 
   return server;
 }

@@ -2,7 +2,11 @@
 
 Personal MCP server for [Honcho](https://honcho.dev), pointed at your **self-hosted** instance. Full tool parity with the official Honcho MCP server, plus an **identity layer** for your configured user and AI peer.
 
-Node 22 · TypeScript · JSON over Streamable HTTP (Docker) and stdio (local clients).
+Node 22 · TypeScript · **[Effect-TS](https://effect.website)** · JSON over Streamable HTTP (Docker) and stdio (local clients).
+
+## Architecture
+
+Every tool is an `Effect.gen` program. Its error channel is typed: `Effect.catch`-style handling maps `MissingWorkspaceError` / `MissingIdentityError` / `HonchoApiError` into the tool's error result — no untyped throw paths. Dependencies (parsed config + workspace-cached Honcho clients) live in a `ToolDepsService` provided by `runTool`, so tests can swap the Honcho client for a stub and drive the full MCP protocol over `InMemoryTransport` — no network, no mocks of the transport layer.
 
 ## Why
 

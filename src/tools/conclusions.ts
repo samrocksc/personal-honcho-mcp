@@ -1,27 +1,23 @@
 import { z } from "zod";
+import { Effect } from "effect";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { ToolContext } from "../types.js";
+import type { ToolDeps } from "../deps.js";
+import { ToolDepsService, apiCall } from "../honcho.js";
+import { runTool } from "../run.js";
 import {
-  textResult,
-  errorResult,
-  errorMessage,
   formatConclusions,
   workspaceIdSchema,
 } from "../types.js";
 
-/** Shared wording: what the attribution fields on a conclusion mean. */
 const ATTRIBUTION_NOTE =
   "Each conclusion carries `level` (explicit = extracted from messages; deductive/inductive/contradiction = derived while dreaming), `source_ids` (the conclusions it was derived from, null for explicit), and `times_derived` (how many times it was independently reached).";
 
-export function register(server: McpServer, ctx: ToolContext) {
+export function register(server: McpServer, deps: ToolDeps) {
   // ── list_conclusions ────────────────────────────────────────────────
   server.registerTool(
     "list_conclusions",
     {
-      annotations: {
-        title: "List Conclusions",
-        readOnlyHint: true,
-      },
+      annotations: { title: "List Conclusions", readOnlyHint: true },
       description: [
         "List conclusions (facts and observations) that Honcho has derived about a peer (paginated).",
         "Use this to see what Honcho has learned. If no target is given, returns self-conclusions.",
@@ -29,7 +25,7 @@ export function register(server: McpServer, ctx: ToolContext) {
         "Returns conclusion objects with pagination metadata.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         peer_id: z.string().describe("The observer peer."),
         target_peer_id: z
           .string()
@@ -70,39 +66,40 @@ export function register(server: McpServer, ctx: ToolContext) {
       page: pageNum,
       size,
       reverse,
-    }) => {
-      try {
-        const peer = await ctx.clientFor(workspace_id).peer(peer_id);
-        const scope = target_peer_id
-          ? peer.conclusionsOf(target_peer_id)
-          : peer.conclusions;
-        const page = await scope.list({
-          session: session_id,
-          filters,
-          page: pageNum,
-          size,
-          reverse,
-        });
-        return textResult({
-          conclusions: formatConclusions(page.items),
-          total: page.total,
-          page: page.page,
-          pages: page.pages,
-        });
-      } catch (e) {
-        return errorResult(errorMessage("Failed to list conclusions", e));
-      }
-    },
+    }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const honcho = yield* d.honchoFor(workspace_id);
+          const peer = yield* apiCall("get peer", () => honcho.peer(peer_id));
+          const view = target_peer_id
+            ? peer.conclusionsOf(target_peer_id)
+            : peer.conclusions;
+          const page = yield* apiCall("list conclusions", () =>
+            view.list({
+              session: session_id,
+              filters,
+              page: pageNum,
+              size,
+              reverse,
+            }),
+          );
+          return {
+            conclusions: formatConclusions(page.items),
+            total: page.total,
+            page: page.page,
+            pages: page.pages,
+          };
+        }),
+        deps,
+      ),
   );
 
   // ── query_conclusions ───────────────────────────────────────────────
   server.registerTool(
     "query_conclusions",
     {
-      annotations: {
-        title: "Query Conclusions",
-        readOnlyHint: true,
-      },
+      annotations: { title: "Query Conclusions", readOnlyHint: true },
       description: [
         "Semantic search across a peer's conclusions.",
         "Use this to find specific knowledge Honcho has derived — more targeted than list_conclusions.",
@@ -110,7 +107,7 @@ export function register(server: McpServer, ctx: ToolContext) {
         "Returns an array of matching conclusions ranked by relevance.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         peer_id: z.string().describe("The observer peer."),
         query: z.string().describe("Semantic search query."),
         target_peer_id: z
@@ -129,28 +126,29 @@ export function register(server: McpServer, ctx: ToolContext) {
           ),
       },
     },
-    async ({ workspace_id, peer_id, query, target_peer_id, top_k, filters }) => {
-      try {
-        const peer = await ctx.clientFor(workspace_id).peer(peer_id);
-        const scope = target_peer_id
-          ? peer.conclusionsOf(target_peer_id)
-          : peer.conclusions;
-        const conclusions = await scope.query(query, top_k, undefined, filters);
-        return textResult(formatConclusions(conclusions));
-      } catch (e) {
-        return errorResult(errorMessage("Query failed", e));
-      }
-    },
+    async ({ workspace_id, peer_id, query, target_peer_id, top_k, filters }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const honcho = yield* d.honchoFor(workspace_id);
+          const peer = yield* apiCall("get peer", () => honcho.peer(peer_id));
+          const view = target_peer_id
+            ? peer.conclusionsOf(target_peer_id)
+            : peer.conclusions;
+          const conclusions = yield* apiCall("query conclusions", () =>
+            view.query(query, top_k, undefined, filters),
+          );
+          return formatConclusions(conclusions);
+        }),
+        deps,
+      ),
   );
 
   // ── get_conclusions ─────────────────────────────────────────────────
   server.registerTool(
     "get_conclusions",
     {
-      annotations: {
-        title: "Get Conclusions",
-        readOnlyHint: true,
-      },
+      annotations: { title: "Get Conclusions", readOnlyHint: true },
       description: [
         "Fetch conclusions by ID, from anywhere in the workspace — no observer/observed pair needed.",
         "Pass the `source_ids` of a conclusion to see the premises it was derived from; repeat to walk a reasoning chain down to the explicit facts it rests on.",
@@ -158,7 +156,7 @@ export function register(server: McpServer, ctx: ToolContext) {
         "IDs that no longer exist are omitted rather than erroring, so a shorter result means some premises have been consolidated or deleted.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         conclusion_ids: z
           .array(z.string())
           .min(1)
@@ -166,30 +164,29 @@ export function register(server: McpServer, ctx: ToolContext) {
           .describe("Conclusion IDs to fetch (max 100)."),
       },
     },
-    async ({ workspace_id, conclusion_ids }) => {
-      try {
-        const conclusions = await ctx
-          .clientFor(workspace_id)
-          .conclusions.getMany(conclusion_ids);
-        const found = new Set(conclusions.map((c) => c.id));
-        return textResult({
-          conclusions: formatConclusions(conclusions),
-          missing: conclusion_ids.filter((id) => !found.has(id)),
-        });
-      } catch (e) {
-        return errorResult(errorMessage("Failed to get conclusions", e));
-      }
-    },
+    async ({ workspace_id, conclusion_ids }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const honcho = yield* d.honchoFor(workspace_id);
+          const conclusions = yield* apiCall("get conclusions", () =>
+            honcho.conclusions.getMany(conclusion_ids),
+          );
+          const found = new Set(conclusions.map((c) => c.id));
+          return {
+            conclusions: formatConclusions(conclusions),
+            missing: conclusion_ids.filter((id) => !found.has(id)),
+          };
+        }),
+        deps,
+      ),
   );
 
   // ── get_derived_conclusions ─────────────────────────────────────────
   server.registerTool(
     "get_derived_conclusions",
     {
-      annotations: {
-        title: "Get Derived Conclusions",
-        readOnlyHint: true,
-      },
+      annotations: { title: "Get Derived Conclusions", readOnlyHint: true },
       description: [
         "List the conclusions derived FROM a given conclusion — those naming it in their `source_ids`.",
         "This walks the reasoning tree upward (premise -> conclusion); `get_conclusions` on a conclusion's `source_ids` walks it downward.",
@@ -197,7 +194,7 @@ export function register(server: McpServer, ctx: ToolContext) {
         "Returns conclusion objects with pagination metadata.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         conclusion_id: z.string().describe("The premise conclusion."),
         page: z.number().int().min(1).optional().describe("Page number (1-indexed)."),
         size: z
@@ -209,41 +206,41 @@ export function register(server: McpServer, ctx: ToolContext) {
           .describe("Results per page (max 100)."),
       },
     },
-    async ({ workspace_id, conclusion_id, page: pageNum, size }) => {
-      try {
-        const page = await ctx.clientFor(workspace_id).conclusions.list({
-          filters: { source_ids: { contains: conclusion_id } },
-          page: pageNum,
-          size,
-        });
-        return textResult({
-          conclusions: formatConclusions(page.items),
-          total: page.total,
-          page: page.page,
-          pages: page.pages,
-        });
-      } catch (e) {
-        return errorResult(errorMessage("Failed to get derived conclusions", e));
-      }
-    },
+    async ({ workspace_id, conclusion_id, page: pageNum, size }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const honcho = yield* d.honchoFor(workspace_id);
+          const page = yield* apiCall("get derived conclusions", () =>
+            honcho.conclusions.list({
+              filters: { source_ids: { contains: conclusion_id } },
+              page: pageNum,
+              size,
+            }),
+          );
+          return {
+            conclusions: formatConclusions(page.items),
+            total: page.total,
+            page: page.page,
+            pages: page.pages,
+          };
+        }),
+        deps,
+      ),
   );
 
   // ── create_conclusions ──────────────────────────────────────────────
   server.registerTool(
     "create_conclusions",
     {
-      annotations: {
-        title: "Create Conclusions",
-        readOnlyHint: false,
-        destructiveHint: false,
-      },
+      annotations: { title: "Create Conclusions", readOnlyHint: false, destructiveHint: false },
       description: [
         "Manually create conclusions (facts/observations) about a peer.",
         "Use this to inject knowledge into Honcho that wasn't derived from conversation.",
         "Returns the number of conclusions created.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         peer_id: z.string().describe("The observer peer."),
         target_peer_id: z
           .string()
@@ -265,40 +262,36 @@ export function register(server: McpServer, ctx: ToolContext) {
       target_peer_id,
       conclusions,
       session_id,
-    }) => {
-      try {
-        const peer = await ctx.clientFor(workspace_id).peer(peer_id);
-        const scope = peer.conclusionsOf(target_peer_id);
-        const params = conclusions.map((content) => ({
-          content,
-          sessionId: session_id,
-        }));
-        await scope.create(params);
-        return textResult(
-          `Created ${conclusions.length} conclusion${conclusions.length === 1 ? "" : "s"} successfully`,
-        );
-      } catch (e) {
-        return errorResult(errorMessage("Failed to create conclusions", e));
-      }
-    },
+    }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const honcho = yield* d.honchoFor(workspace_id);
+          const peer = yield* apiCall("get peer", () => honcho.peer(peer_id));
+          const view = peer.conclusionsOf(target_peer_id);
+          yield* apiCall("create conclusions", () =>
+            view.create(
+              conclusions.map((content) => ({ content, sessionId: session_id })),
+            ),
+          );
+          return `Created ${conclusions.length} conclusion${conclusions.length === 1 ? "" : "s"} successfully`;
+        }),
+        deps,
+      ),
   );
 
   // ── delete_conclusion ───────────────────────────────────────────────
   server.registerTool(
     "delete_conclusion",
     {
-      annotations: {
-        title: "Delete Conclusion",
-        readOnlyHint: false,
-        destructiveHint: true,
-      },
+      annotations: { title: "Delete Conclusion", readOnlyHint: false, destructiveHint: true },
       description: [
         "Delete a specific conclusion by ID.",
         "Use query_conclusions or list_conclusions to find the ID first.",
         "Use this to remove incorrect or outdated knowledge.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         peer_id: z.string().describe("The observer peer."),
         target_peer_id: z
           .string()
@@ -306,15 +299,17 @@ export function register(server: McpServer, ctx: ToolContext) {
         conclusion_id: z.string().describe("The conclusion to delete."),
       },
     },
-    async ({ workspace_id, peer_id, target_peer_id, conclusion_id }) => {
-      try {
-        const peer = await ctx.clientFor(workspace_id).peer(peer_id);
-        const scope = peer.conclusionsOf(target_peer_id);
-        await scope.delete(conclusion_id);
-        return textResult("Conclusion deleted successfully");
-      } catch (e) {
-        return errorResult(errorMessage("Failed to delete conclusion", e));
-      }
-    },
+    async ({ workspace_id, peer_id, target_peer_id, conclusion_id }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const honcho = yield* d.honchoFor(workspace_id);
+          const peer = yield* apiCall("get peer", () => honcho.peer(peer_id));
+          const view = peer.conclusionsOf(target_peer_id);
+          yield* apiCall("delete conclusion", () => view.delete(conclusion_id));
+          return "Conclusion deleted successfully";
+        }),
+        deps,
+      ),
   );
 }

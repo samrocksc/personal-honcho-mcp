@@ -1,30 +1,27 @@
 import { z } from "zod";
+import { Effect } from "effect";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { ToolContext } from "../types.js";
+import type { ToolDeps } from "../deps.js";
+import { ToolDepsService, apiCall } from "../honcho.js";
+import { runTool } from "../run.js";
 import {
-  textResult,
   errorResult,
-  errorMessage,
   workspaceIdSchema,
 } from "../types.js";
 
-export function register(server: McpServer, ctx: ToolContext) {
+export function register(server: McpServer, deps: ToolDeps) {
   // ── create_peer ─────────────────────────────────────────────────────
   server.registerTool(
     "create_peer",
     {
-      annotations: {
-        title: "Create Peer",
-        readOnlyHint: false,
-        destructiveHint: false,
-      },
+      annotations: { title: "Create Peer", readOnlyHint: false, destructiveHint: false },
       description: [
         "Get or create a peer with the given ID.",
         "Use this to register a new participant (user or agent) in the workspace.",
         "Returns the peer ID and any configuration that was set.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         peer_id: z.string().describe("Unique identifier for the peer."),
         configuration: z
           .object({
@@ -36,63 +33,61 @@ export function register(server: McpServer, ctx: ToolContext) {
           .describe("Optional peer configuration."),
       },
     },
-    async ({ workspace_id, peer_id, configuration }) => {
-      try {
-        const peer = await ctx.clientFor(workspace_id).peer(peer_id, {
-          configuration,
-        });
-        return textResult({ peer_id: peer.id, configuration: peer.configuration });
-      } catch (e) {
-        return errorResult(errorMessage("Failed to create peer", e));
-      }
-    },
+    async ({ workspace_id, peer_id, configuration }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const honcho = yield* d.honchoFor(workspace_id);
+          const peer = yield* apiCall("create peer", () =>
+            honcho.peer(peer_id, { configuration }),
+          );
+          return { peer_id: peer.id, configuration: peer.configuration };
+        }),
+        deps,
+      ),
   );
 
   // ── list_peers ──────────────────────────────────────────────────────
   server.registerTool(
     "list_peers",
     {
-      annotations: {
-        title: "List Peers",
-        readOnlyHint: true,
-      },
+      annotations: { title: "List Peers", readOnlyHint: true },
       description: [
         "List peers in the given workspace (paginated).",
         "Use this to discover which users and agents exist.",
         "Returns peer IDs with pagination metadata; pass page/size to walk past the first page.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         page: z.number().int().min(1).optional().describe("Page number (1-indexed)."),
         size: z.number().int().min(1).max(100).optional().describe("Results per page (max 100)."),
         reverse: z.boolean().optional().describe("Newest first when true."),
       },
     },
-    async ({ workspace_id, page: pageNum, size, reverse }) => {
-      try {
-        const page = await ctx
-          .clientFor(workspace_id)
-          .peers({ page: pageNum, size, reverse });
-        return textResult({
-          peers: page.items.map((p) => ({ id: p.id })),
-          total: page.total,
-          page: page.page,
-          pages: page.pages,
-        });
-      } catch (e) {
-        return errorResult(errorMessage("Failed to list peers", e));
-      }
-    },
+    async ({ workspace_id, page: pageNum, size, reverse }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const honcho = yield* d.honchoFor(workspace_id);
+          const p = yield* apiCall("list peers", () =>
+            honcho.peers({ page: pageNum, size, reverse }),
+          );
+          return {
+            peers: p.items.map((x) => ({ id: x.id })),
+            total: p.total,
+            page: p.page,
+            pages: p.pages,
+          };
+        }),
+        deps,
+      ),
   );
 
   // ── chat ────────────────────────────────────────────────────────────
   server.registerTool(
     "chat",
     {
-      annotations: {
-        title: "Ask About a Peer",
-        readOnlyHint: true,
-      },
+      annotations: { title: "Ask About a Peer", readOnlyHint: true },
       description: [
         "Ask a natural-language question about ONE peer and get an answer from Honcho's reasoning system.",
         "Requires `peer_id`. Answers from that peer's representation only — not the rest of the workspace.",
@@ -102,7 +97,7 @@ export function register(server: McpServer, ctx: ToolContext) {
         "With `include_evidence`, returns an object instead: the answer plus what the agent read to produce it.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         peer_id: z.string().describe("The peer to query about."),
         query: z.string().describe("Natural-language question."),
         target_peer_id: z
@@ -152,46 +147,44 @@ export function register(server: McpServer, ctx: ToolContext) {
       sessions,
       reasoning_level,
       include_evidence,
-    }) => {
-      try {
-        const peer = await ctx.clientFor(workspace_id).peer(peer_id);
-        const options = {
-          target: target_peer_id,
-          session: session_id,
-          scope,
-          sessions,
-          reasoningLevel: reasoning_level ?? ctx.config.reasoningLevel,
-        };
-        if (!include_evidence) {
-          const result = await peer.chat(query, options);
-          return textResult(result ?? "None");
-        }
-        const { content, evidence } = await peer.chat(query, {
-          ...options,
-          includeEvidence: true,
-        });
-        return textResult({ content: content ?? "None", evidence });
-      } catch (e) {
-        return errorResult(errorMessage("Chat failed", e));
-      }
-    },
+    }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const honcho = yield* d.honchoFor(workspace_id);
+          const peer = yield* apiCall("get peer", () => honcho.peer(peer_id));
+          const options = {
+            target: target_peer_id,
+            session: session_id,
+            scope,
+            sessions,
+            reasoningLevel: reasoning_level ?? d.config.reasoningLevel,
+          };
+          if (!include_evidence) {
+            const result = yield* apiCall("chat", () => peer.chat(query, options));
+            return result ?? "None";
+          }
+          const { content, evidence } = yield* apiCall("chat", () =>
+            peer.chat(query, { ...options, includeEvidence: true }),
+          );
+          return { content: content ?? "None", evidence };
+        }),
+        deps,
+      ),
   );
 
   // ── get_peer_card ───────────────────────────────────────────────────
   server.registerTool(
     "get_peer_card",
     {
-      annotations: {
-        title: "Get Peer Card",
-        readOnlyHint: true,
-      },
+      annotations: { title: "Get Peer Card", readOnlyHint: true },
       description: [
         "Get the peer card — a compact set of biographical facts about a peer.",
         "Use this when you need a quick summary of who someone is.",
         "Returns an array of fact strings, or null if no card exists yet.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         peer_id: z.string().describe("The observer peer."),
         target_peer_id: z
           .string()
@@ -201,33 +194,33 @@ export function register(server: McpServer, ctx: ToolContext) {
           ),
       },
     },
-    async ({ workspace_id, peer_id, target_peer_id }) => {
-      try {
-        const peer = await ctx.clientFor(workspace_id).peer(peer_id);
-        const card = await peer.getCard(target_peer_id);
-        return textResult(card ?? "No peer card found.");
-      } catch (e) {
-        return errorResult(errorMessage("Failed to get peer card", e));
-      }
-    },
+    async ({ workspace_id, peer_id, target_peer_id }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const honcho = yield* d.honchoFor(workspace_id);
+          const peer = yield* apiCall("get peer", () => honcho.peer(peer_id));
+          const card = yield* apiCall("get peer card", () =>
+            peer.getCard(target_peer_id),
+          );
+          return card ?? "No peer card found.";
+        }),
+        deps,
+      ),
   );
 
   // ── set_peer_card ───────────────────────────────────────────────────
   server.registerTool(
     "set_peer_card",
     {
-      annotations: {
-        title: "Set Peer Card",
-        readOnlyHint: false,
-        destructiveHint: true,
-      },
+      annotations: { title: "Set Peer Card", readOnlyHint: false, destructiveHint: true },
       description: [
         "Set or update the peer card — a list of biographical facts about a peer.",
         "Use this to manually establish or correct facts about a peer.",
         "Returns the updated peer card.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         peer_id: z.string().describe("The observer peer."),
         peer_card: z
           .array(z.string())
@@ -240,32 +233,33 @@ export function register(server: McpServer, ctx: ToolContext) {
           ),
       },
     },
-    async ({ workspace_id, peer_id, peer_card, target_peer_id }) => {
-      try {
-        const peer = await ctx.clientFor(workspace_id).peer(peer_id);
-        const result = await peer.setCard(peer_card, target_peer_id);
-        return textResult(result ?? "Peer card set successfully");
-      } catch (e) {
-        return errorResult(errorMessage("Failed to set peer card", e));
-      }
-    },
+    async ({ workspace_id, peer_id, peer_card, target_peer_id }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const honcho = yield* d.honchoFor(workspace_id);
+          const peer = yield* apiCall("get peer", () => honcho.peer(peer_id));
+          const result = yield* apiCall("set peer card", () =>
+            peer.setCard(peer_card, target_peer_id),
+          );
+          return result ?? "Peer card set successfully";
+        }),
+        deps,
+      ),
   );
 
   // ── get_peer_context ────────────────────────────────────────────────
   server.registerTool(
     "get_peer_context",
     {
-      annotations: {
-        title: "Get Peer Context",
-        readOnlyHint: true,
-      },
+      annotations: { title: "Get Peer Context", readOnlyHint: true },
       description: [
         "Get comprehensive context for a peer — combines their representation (conclusions) and peer card.",
         "Use this when you need the full picture of what Honcho knows about someone.",
         "Returns an object with representation, peer_card, peer_id, and target_id.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         peer_id: z.string().describe("The observer peer."),
         target_peer_id: z
           .string()
@@ -287,41 +281,42 @@ export function register(server: McpServer, ctx: ToolContext) {
       target_peer_id,
       search_query,
       max_conclusions,
-    }) => {
-      try {
-        const peer = await ctx.clientFor(workspace_id).peer(peer_id);
-        const context = await peer.context({
-          target: target_peer_id,
-          searchQuery: search_query,
-          maxConclusions: max_conclusions,
-        });
-        return textResult({
-          peer_id: context.peerId,
-          target_id: context.targetId,
-          representation: context.representation,
-          peer_card: context.peerCard,
-        });
-      } catch (e) {
-        return errorResult(errorMessage("Failed to get peer context", e));
-      }
-    },
+    }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const honcho = yield* d.honchoFor(workspace_id);
+          const peer = yield* apiCall("get peer", () => honcho.peer(peer_id));
+          const context = yield* apiCall("get peer context", () =>
+            peer.context({
+              target: target_peer_id,
+              searchQuery: search_query,
+              maxConclusions: max_conclusions,
+            }),
+          );
+          return {
+            peer_id: context.peerId,
+            target_id: context.targetId,
+            representation: context.representation,
+            peer_card: context.peerCard,
+          };
+        }),
+        deps,
+      ),
   );
 
   // ── get_representation ──────────────────────────────────────────────
   server.registerTool(
     "get_representation",
     {
-      annotations: {
-        title: "Get Peer Representation",
-        readOnlyHint: true,
-      },
+      annotations: { title: "Get Peer Representation", readOnlyHint: true },
       description: [
         "Get the formatted representation for a peer — a text summary built from their conclusions.",
         "Use this when you want the textual representation without the peer card.",
         "Returns a formatted string of conclusions.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         peer_id: z.string().describe("The observer peer."),
         target_peer_id: z
           .string()
@@ -363,21 +358,25 @@ export function register(server: McpServer, ctx: ToolContext) {
       sessions,
       search_query,
       max_conclusions,
-    }) => {
-      try {
-        const peer = await ctx.clientFor(workspace_id).peer(peer_id);
-        const rep = await peer.representation({
-          target: target_peer_id,
-          session: session_id,
-          scope,
-          sessions,
-          searchQuery: search_query,
-          maxConclusions: max_conclusions,
-        });
-        return textResult(rep);
-      } catch (e) {
-        return errorResult(errorMessage("Failed to get representation", e));
-      }
-    },
+    }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const honcho = yield* d.honchoFor(workspace_id);
+          const peer = yield* apiCall("get peer", () => honcho.peer(peer_id));
+          const rep = yield* apiCall("get representation", () =>
+            peer.representation({
+              target: target_peer_id,
+              session: session_id,
+              scope,
+              sessions,
+              searchQuery: search_query,
+              maxConclusions: max_conclusions,
+            }),
+          );
+          return rep;
+        }),
+        deps,
+      ),
   );
 }

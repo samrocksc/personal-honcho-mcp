@@ -1,29 +1,49 @@
-import type { ToolContext } from "./types.js";
-import { missingIdentityMessage } from "./config.js";
+import { Effect } from "effect";
+import { ToolDepsService } from "./honcho.js";
+import { MissingIdentityError } from "./errors.js";
 
 /**
- * Resolve the user peer ID for identity tools: explicit argument wins,
- * then the HONCHO_USER_PEER_ID default. Throws with a clear message when
- * unresolvable.
+ * Resolve the AI peer ID: explicit argument wins, then the HONCHO_AI_PEER_ID
+ * default configured on the server.
  */
-export function resolveUserPeerId(
-  ctx: ToolContext,
-  userPeerId?: string | null,
-): string {
-  const id = userPeerId?.trim() || ctx.config.userPeerId?.trim();
-  if (!id) throw new Error(missingIdentityMessage("user"));
-  return id;
+export function resolveAiPeer(
+  aiPeerId: string | undefined,
+): Effect.Effect<string, MissingIdentityError, ToolDepsService> {
+  return Effect.gen(function* () {
+    const deps = yield* ToolDepsService;
+    const id = aiPeerId?.trim() || deps.config.aiPeerId?.trim();
+    if (!id) return yield* Effect.fail(new MissingIdentityError({ kind: "ai" }));
+    return id;
+  });
 }
 
 /**
- * Resolve the AI peer ID for identity tools: explicit argument wins, then the
- * HONCHO_AI_PEER_ID default. Throws with a clear message when unresolvable.
+ * Resolve the user peer ID: explicit argument wins, then the
+ * HONCHO_USER_PEER_ID default configured on the server.
  */
-export function resolveAiPeerId(
-  ctx: ToolContext,
-  aiPeerId?: string | null,
-): string {
-  const id = aiPeerId?.trim() || ctx.config.aiPeerId?.trim();
-  if (!id) throw new Error(missingIdentityMessage("ai_peer"));
-  return id;
+export function resolveUserPeer(
+  userPeerId: string | undefined,
+): Effect.Effect<string, MissingIdentityError, ToolDepsService> {
+  return Effect.gen(function* () {
+    const deps = yield* ToolDepsService;
+    const id = userPeerId?.trim() || deps.config.userPeerId?.trim();
+    if (!id) return yield* Effect.fail(new MissingIdentityError({ kind: "user" }));
+    return id;
+  });
+}
+
+/** Resolve both identities at once (AI peer observing the user). */
+export function resolveIdentityPair(
+  aiPeerId: string | undefined,
+  userPeerId: string | undefined,
+): Effect.Effect<
+  { readonly aiPeerId: string; readonly userPeerId: string },
+  MissingIdentityError,
+  ToolDepsService
+> {
+  const ai = resolveAiPeer(aiPeerId);
+  const user = resolveUserPeer(userPeerId);
+  return Effect.all([ai, user]).pipe(
+    Effect.map(([aiPeerId, userPeerId]) => ({ aiPeerId, userPeerId })),
+  );
 }

@@ -1,14 +1,14 @@
 import { z } from "zod";
+import { Effect } from "effect";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { ToolContext } from "../types.js";
+import type { ToolDeps } from "../deps.js";
+import { ToolDepsService, apiCall } from "../honcho.js";
+import { runTool } from "../run.js";
+import { resolveIdentityPair } from "../identity.js";
 import {
-  textResult,
-  errorResult,
-  errorMessage,
   formatConclusions,
   workspaceIdSchema,
 } from "../types.js";
-import { resolveAiPeerId, resolveUserPeerId } from "../identity.js";
 
 /**
  * Identity conclusions: let the assistant maintain facts about the configured
@@ -19,16 +19,16 @@ import { resolveAiPeerId, resolveUserPeerId } from "../identity.js";
  *
  * Honcho treats conclusion content as immutable, so update_my_conclusion
  * fetches the old conclusion, deletes it, and recreates it with the same
- * session (or an explicit replacement) — content otherwise never changes.
+ * session (or an explicit replacement).
  */
-export function register(server: McpServer, ctx: ToolContext) {
+export function register(server: McpServer, deps: ToolDeps) {
   const userIdSchema = (description: string) =>
     z
       .string()
       .optional()
       .describe(
-        ctx.config.userPeerId
-          ? `${description} Defaults to the server's HONCHO_USER_PEER_ID=${ctx.config.userPeerId}; omit unless overriding.`
+        deps.config.userPeerId
+          ? `${description} Defaults to the server's HONCHO_USER_PEER_ID=${deps.config.userPeerId}; omit unless overriding.`
           : `${description} No server default configured (HONCHO_USER_PEER_ID unset).`,
       );
 
@@ -37,33 +37,38 @@ export function register(server: McpServer, ctx: ToolContext) {
       .string()
       .optional()
       .describe(
-        ctx.config.aiPeerId
-          ? `${description} Defaults to the server's HONCHO_AI_PEER_ID=${ctx.config.aiPeerId}; omit unless overriding (e.g. pass a different AI peer's name).`
+        deps.config.aiPeerId
+          ? `${description} Defaults to the server's HONCHO_AI_PEER_ID=${deps.config.aiPeerId}; omit unless overriding (e.g. pass a different AI peer's name).`
           : `${description} No server default configured (HONCHO_AI_PEER_ID unset).`,
       );
 
-  /** Resolve both peers and return the AI-observes-user ConclusionsView. */
-  const viewFor = async (
-    workspace_id: string | undefined,
+  const withIdentity = <A>(
     ai_peer_id: string | undefined,
     user_peer_id: string | undefined,
-  ) => {
-    const aiPeerId = resolveAiPeerId(ctx, ai_peer_id);
-    const userPeerId = resolveUserPeerId(ctx, user_peer_id);
-    const peer = await ctx.clientFor(workspace_id).peer(aiPeerId);
-    const view = peer.conclusionsOf(userPeerId);
-    return { view, aiPeerId, userPeerId };
-  };
+    make: (ids: { aiPeerId: string; userPeerId: string }) => Effect.Effect<A, unknown, ToolDepsService>,
+  ) =>
+    Effect.gen(function* () {
+      const ids = yield* resolveIdentityPair(ai_peer_id, user_peer_id);
+      return yield* make(ids);
+    });
+
+  /** Resolve identities → AI-peer client → (AI observes user) conclusions view. */
+  const myView = (
+    honchoFor: ToolDeps["honchoFor"],
+    workspace_id: string | undefined,
+    ids: { aiPeerId: string; userPeerId: string },
+  ) =>
+    Effect.gen(function* () {
+      const honcho = yield* honchoFor(workspace_id);
+      const peer = yield* apiCall("get AI peer", () => honcho.peer(ids.aiPeerId));
+      return peer.conclusionsOf(ids.userPeerId);
+    });
 
   // ── conclude_about_me ───────────────────────────────────────────────
   server.registerTool(
     "conclude_about_me",
     {
-      annotations: {
-        title: "Conclude About Me",
-        readOnlyHint: false,
-        destructiveHint: false,
-      },
+      annotations: { title: "Conclude About Me", readOnlyHint: false, destructiveHint: false },
       description: [
         "Record one or more facts/observations about you (the configured user) into Honcho's memory, attributed to the AI peer.",
         "Use this whenever you learn something durable about the user worth remembering: preferences, biographical facts, project context, corrections.",
@@ -71,12 +76,12 @@ export function register(server: McpServer, ctx: ToolContext) {
         "Returns the created conclusions with their IDs (pass one to update_my_conclusion later).",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         conclusions: z
           .array(z.string())
           .min(1)
           .describe(
-            "Fact strings to record about the user. Write them as standalone factual statements, e.g. 'Prefers bun over bun-like tooling' — no context needed.",
+            "Fact strings to record about the user. Write them as standalone factual statements, e.g. 'Prefers dark mode everywhere' — no context needed.",
           ),
         session_id: z
           .string()
@@ -94,43 +99,40 @@ export function register(server: McpServer, ctx: ToolContext) {
       session_id,
       ai_peer_id,
       user_peer_id,
-    }) => {
-      try {
-        const { view, aiPeerId, userPeerId } = await viewFor(
-          workspace_id,
-          ai_peer_id,
-          user_peer_id,
-        );
-        const created = await view.create(
-          conclusions.map((content) => ({ content, sessionId: session_id })),
-        );
-        return textResult({
-          ai_peer_id: aiPeerId,
-          user_peer_id: userPeerId,
-          created: created.map((c) => ({ id: c.id, content: c.content })),
-          count: created.length,
-        });
-      } catch (e) {
-        return errorResult(errorMessage("Failed to conclude", e));
-      }
-    },
+    }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const ids = yield* resolveIdentityPair(ai_peer_id, user_peer_id);
+          const view = yield* myView(d.honchoFor, workspace_id, ids);
+          const created = yield* apiCall("create my conclusions", () =>
+            view.create(
+              conclusions.map((content) => ({ content, sessionId: session_id })),
+            ),
+          );
+          return {
+            ai_peer_id: ids.aiPeerId,
+            user_peer_id: ids.userPeerId,
+            created: created.map((c) => ({ id: c.id, content: c.content })),
+            count: created.length,
+          };
+        }),
+        deps,
+      ),
   );
 
   // ── list_my_conclusions ─────────────────────────────────────────────
   server.registerTool(
     "list_my_conclusions",
     {
-      annotations: {
-        title: "List My Conclusions",
-        readOnlyHint: true,
-      },
+      annotations: { title: "List My Conclusions", readOnlyHint: true },
       description: [
         "List the conclusions the AI peer holds about you (the configured user), newest first by default.",
         "Use this to review what Honcho has recorded about the user — including what conclude_about_me wrote.",
         "Optional filters, e.g. {\"level\": \"explicit\"}. Returns conclusion objects (id, content, level, session_id, created_at) with pagination metadata.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         filters: z
           .looseObject({})
           .optional()
@@ -166,43 +168,44 @@ export function register(server: McpServer, ctx: ToolContext) {
       reverse,
       ai_peer_id,
       user_peer_id,
-    }) => {
-      try {
-        const { view } = await viewFor(workspace_id, ai_peer_id, user_peer_id);
-        const page = await view.list({
-          filters,
-          session: session_id,
-          page: pageNum,
-          size,
-          reverse,
-        });
-        return textResult({
-          conclusions: formatConclusions(page.items),
-          total: page.total,
-          page: page.page,
-          pages: page.pages,
-        });
-      } catch (e) {
-        return errorResult(errorMessage("Failed to list my conclusions", e));
-      }
-    },
+    }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const ids = yield* resolveIdentityPair(ai_peer_id, user_peer_id);
+          const view = yield* myView(d.honchoFor, workspace_id, ids);
+          const page = yield* apiCall("list my conclusions", () =>
+            view.list({
+              filters,
+              session: session_id,
+              page: pageNum,
+              size,
+              reverse,
+            }),
+          );
+          return {
+            conclusions: formatConclusions(page.items),
+            total: page.total,
+            page: page.page,
+            pages: page.pages,
+          };
+        }),
+        deps,
+      ),
   );
 
   // ── query_my_conclusions ────────────────────────────────────────────
   server.registerTool(
     "query_my_conclusions",
     {
-      annotations: {
-        title: "Query My Conclusions",
-        readOnlyHint: true,
-      },
+      annotations: { title: "Query My Conclusions", readOnlyHint: true },
       description: [
         "Semantic search across the conclusions the AI peer holds about you.",
         "Use this to find specific recorded facts before updating or deleting them.",
         "Returns an array of matching conclusions ranked by relevance.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         query: z.string().describe("Semantic search query."),
         top_k: z
           .number()
@@ -225,37 +228,39 @@ export function register(server: McpServer, ctx: ToolContext) {
       filters,
       ai_peer_id,
       user_peer_id,
-    }) => {
-      try {
-        const { view } = await viewFor(workspace_id, ai_peer_id, user_peer_id);
-        const conclusions = await view.query(query, top_k, undefined, filters);
-        return textResult(formatConclusions(conclusions));
-      } catch (e) {
-        return errorResult(errorMessage("Failed to query my conclusions", e));
-      }
-    },
+    }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const ids = yield* resolveIdentityPair(ai_peer_id, user_peer_id);
+          const view = yield* myView(d.honchoFor, workspace_id, ids);
+          const conclusions = yield* apiCall("query my conclusions", () =>
+            view.query(query, top_k, undefined, filters),
+          );
+          return formatConclusions(conclusions);
+        }),
+        deps,
+      ),
   );
 
   // ── update_my_conclusion ────────────────────────────────────────────
   server.registerTool(
     "update_my_conclusion",
     {
-      annotations: {
-        title: "Update My Conclusion",
-        readOnlyHint: false,
-        destructiveHint: true,
-      },
+      annotations: { title: "Update My Conclusion", readOnlyHint: false, destructiveHint: true },
       description: [
         "Replace the content of a conclusion the AI peer holds about you.",
-        "Honcho conclusion content is immutable: this fetches the old conclusion, deletes it, and creates a new one with identical metadata (observer, observed, session, level preserved as 'explicit' for the fresh record).",
+        "Honcho conclusion content is immutable: this fetches the old conclusion, deletes it, and creates a new one with identical metadata (observer, observed, session).",
         "Use this to correct or refine a recorded fact — e.g. the user changed jobs, or the original conclusion was wrong.",
         "Returns the new conclusion and echoes the deleted one's ID.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         conclusion_id: z
           .string()
-          .describe("ID of the conclusion to update (from conclude_about_me / list_my_conclusions / query_my_conclusions)."),
+          .describe(
+            "ID of the conclusion to update (from conclude_about_me / list_my_conclusions / query_my_conclusions).",
+          ),
         content: z
           .string()
           .describe("The replacement conclusion text."),
@@ -276,51 +281,48 @@ export function register(server: McpServer, ctx: ToolContext) {
       session_id,
       ai_peer_id,
       user_peer_id,
-    }) => {
-      try {
-        const { view, aiPeerId, userPeerId } = await viewFor(
-          workspace_id,
-          ai_peer_id,
-          user_peer_id,
-        );
-        // Content is immutable server-side, so replace: fetch → delete → create.
-        const workspace = ctx.clientFor(workspace_id);
-        const existing = await workspace.conclusions.get(conclusion_id);
-        await view.delete(conclusion_id);
-        const [replacement] = await view.create([
-          {
-            content,
-            sessionId: session_id ?? existing.sessionId ?? undefined,
-          },
-        ]);
-        return textResult({
-          deleted_id: conclusion_id,
-          new_conclusion: { id: replacement.id, content: replacement.content },
-          ai_peer_id: aiPeerId,
-          user_peer_id: userPeerId,
-        });
-      } catch (e) {
-        return errorResult(errorMessage("Failed to update my conclusion", e));
-      }
-    },
+    }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const ids = yield* resolveIdentityPair(ai_peer_id, user_peer_id);
+          const honcho = yield* d.honchoFor(workspace_id);
+          const existing = yield* apiCall("get conclusion", () =>
+            honcho.conclusions.get(conclusion_id),
+          );
+          const view = yield* myView(d.honchoFor, workspace_id, ids);
+          yield* apiCall("delete old conclusion", () => view.delete(conclusion_id));
+          const [replacement] = yield* apiCall("create replacement conclusion", () =>
+            view.create([
+              {
+                content,
+                sessionId: session_id ?? existing.sessionId ?? undefined,
+              },
+            ]),
+          );
+          return {
+            deleted_id: conclusion_id,
+            new_conclusion: { id: replacement.id, content: replacement.content },
+            ai_peer_id: ids.aiPeerId,
+            user_peer_id: ids.userPeerId,
+          };
+        }),
+        deps,
+      ),
   );
 
   // ── delete_my_conclusion ────────────────────────────────────────────
   server.registerTool(
     "delete_my_conclusion",
     {
-      annotations: {
-        title: "Delete My Conclusion",
-        readOnlyHint: false,
-        destructiveHint: true,
-      },
+      annotations: { title: "Delete My Conclusion", readOnlyHint: false, destructiveHint: true },
       description: [
         "Delete a conclusion the AI peer holds about you.",
         "Use this to remove wrong or outdated facts. Read get_derived_conclusions first if unsure what reasoning was built on this fact.",
         "Returns the deleted conclusion's ID.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         conclusion_id: z
           .string()
           .describe("ID of the conclusion to delete."),
@@ -333,22 +335,20 @@ export function register(server: McpServer, ctx: ToolContext) {
       conclusion_id,
       ai_peer_id,
       user_peer_id,
-    }) => {
-      try {
-        const { view, aiPeerId, userPeerId } = await viewFor(
-          workspace_id,
-          ai_peer_id,
-          user_peer_id,
-        );
-        await view.delete(conclusion_id);
-        return textResult({
-          deleted_id: conclusion_id,
-          ai_peer_id: aiPeerId,
-          user_peer_id: userPeerId,
-        });
-      } catch (e) {
-        return errorResult(errorMessage("Failed to delete my conclusion", e));
-      }
-    },
+    }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const ids = yield* resolveIdentityPair(ai_peer_id, user_peer_id);
+          const view = yield* myView(d.honchoFor, workspace_id, ids);
+          yield* apiCall("delete my conclusion", () => view.delete(conclusion_id));
+          return {
+            deleted_id: conclusion_id,
+            ai_peer_id: ids.aiPeerId,
+            user_peer_id: ids.userPeerId,
+          };
+        }),
+        deps,
+      ),
   );
 }

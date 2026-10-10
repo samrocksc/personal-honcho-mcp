@@ -1,11 +1,11 @@
 import { z } from "zod";
+import { Effect } from "effect";
 import { Scope, type Honcho } from "@honcho-ai/sdk";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { ToolContext } from "../types.js";
+import type { ToolDeps } from "../deps.js";
+import { ToolDepsService, apiCall } from "../honcho.js";
+import { runTool } from "../run.js";
 import {
-  textResult,
-  errorResult,
-  errorMessage,
   workspaceIdSchema,
 } from "../types.js";
 
@@ -34,61 +34,58 @@ const sizeSchema = z
   .optional()
   .describe("Results per page (max 100).");
 
-export function register(server: McpServer, ctx: ToolContext) {
+export function register(server: McpServer, deps: ToolDeps) {
   // ── list_scopes ─────────────────────────────────────────────────────
   server.registerTool(
     "list_scopes",
     {
-      annotations: {
-        title: "List Scopes",
-        readOnlyHint: true,
-      },
+      annotations: { title: "List Scopes", readOnlyHint: true },
       description: [
         "List the scopes in a workspace (paginated).",
         "A scope is a named set of sessions that acts as a recall boundary: chat with scope=<name> answers only from that scope's sessions.",
         "Returns each scope's id, metadata, and created_at.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         page: pageSchema,
         size: sizeSchema,
       },
     },
-    async ({ workspace_id, page: pageNum, size }) => {
-      try {
-        const page = await ctx.clientFor(workspace_id).scopes({ page: pageNum, size });
-        return textResult({
-          scopes: page.items.map((s) => ({
-            id: s.id,
-            metadata: s.metadata ?? {},
-            created_at: s.createdAt,
-          })),
-          total: page.total,
-          page: page.page,
-          pages: page.pages,
-        });
-      } catch (e) {
-        return errorResult(errorMessage("Failed to list scopes", e));
-      }
-    },
+    async ({ workspace_id, page: pageNum, size }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const honcho = yield* d.honchoFor(workspace_id);
+          const page = yield* apiCall("list scopes", () =>
+            honcho.scopes({ page: pageNum, size }),
+          );
+          return {
+            scopes: page.items.map((s) => ({
+              id: s.id,
+              metadata: s.metadata ?? {},
+              created_at: s.createdAt,
+            })),
+            total: page.total,
+            page: page.page,
+            pages: page.pages,
+          };
+        }),
+        deps,
+      ),
   );
 
   // ── create_scope ────────────────────────────────────────────────────
   server.registerTool(
     "create_scope",
     {
-      annotations: {
-        title: "Create Scope",
-        readOnlyHint: false,
-        destructiveHint: false,
-      },
+      annotations: { title: "Create Scope", readOnlyHint: false, destructiveHint: false },
       description: [
         "Get or create a scope with the given ID.",
         "A scope is a named set of sessions that acts as a recall boundary. Optional metadata (e.g. a label, description, example queries) is stored with it.",
         "Sessions are added separately with add_sessions_to_scope. Returns the scope's id, metadata, and created_at.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         scope_id: z
           .string()
           .describe("Scope name, unique within the workspace (e.g. 'therapy', 'honcho-core')."),
@@ -98,38 +95,36 @@ export function register(server: McpServer, ctx: ToolContext) {
           .describe("Optional metadata to store with the scope."),
       },
     },
-    async ({ workspace_id, scope_id, metadata }) => {
-      try {
-        const scope = await ctx
-          .clientFor(workspace_id)
-          .scope(scope_id, metadata ? { metadata } : undefined);
-        return textResult({
-          id: scope.id,
-          metadata: scope.metadata ?? {},
-          created_at: scope.createdAt,
-        });
-      } catch (e) {
-        return errorResult(errorMessage("Failed to create scope", e));
-      }
-    },
+    async ({ workspace_id, scope_id, metadata }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const honcho = yield* d.honchoFor(workspace_id);
+          const scope = yield* apiCall("create scope", () =>
+            honcho.scope(scope_id, metadata ? { metadata } : undefined),
+          );
+          return {
+            id: scope.id,
+            metadata: scope.metadata ?? {},
+            created_at: scope.createdAt,
+          };
+        }),
+        deps,
+      ),
   );
 
   // ── add_sessions_to_scope ───────────────────────────────────────────
   server.registerTool(
     "add_sessions_to_scope",
     {
-      annotations: {
-        title: "Add Sessions to Scope",
-        readOnlyHint: false,
-        destructiveHint: false,
-      },
+      annotations: { title: "Add Sessions to Scope", readOnlyHint: false, destructiveHint: false },
       description: [
         "Add sessions to a scope. Every session must already exist; re-adding a member is a no-op.",
         "Sessions that already hold messages are backfilled into the scope asynchronously — poll get_scope_status before relying on scoped recall for them.",
         "At most 100 sessions per call.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         scope_id: z.string().describe("The scope to add sessions to."),
         session_ids: z
           .array(z.string())
@@ -138,120 +133,129 @@ export function register(server: McpServer, ctx: ToolContext) {
           .describe("Session IDs to add (max 100)."),
       },
     },
-    async ({ workspace_id, scope_id, session_ids }) => {
-      try {
-        const scope = await ctx.clientFor(workspace_id).scope(scope_id);
-        await scope.addSessions(session_ids);
-        return textResult({ scope_id, added: session_ids.length });
-      } catch (e) {
-        return errorResult(errorMessage("Failed to add sessions to scope", e));
-      }
-    },
+    async ({ workspace_id, scope_id, session_ids }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const honcho = yield* d.honchoFor(workspace_id);
+          const scope = yield* apiCall("get or create scope", () =>
+            honcho.scope(scope_id),
+          );
+          yield* apiCall("add sessions to scope", () =>
+            scope.addSessions(session_ids),
+          );
+          return { scope_id, added: session_ids.length };
+        }),
+        deps,
+      ),
   );
 
   // ── remove_session_from_scope ───────────────────────────────────────
   server.registerTool(
     "remove_session_from_scope",
     {
-      annotations: {
-        title: "Remove Session from Scope",
-        readOnlyHint: false,
-        destructiveHint: true,
-      },
+      annotations: { title: "Remove Session from Scope", readOnlyHint: false, destructiveHint: true },
       description: [
         "Remove a session from a scope.",
         "Conclusions derived while it was a member are reconciled out asynchronously; the session itself is untouched.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         scope_id: z.string().describe("The scope to remove the session from."),
         session_id: z.string().describe("The session to remove."),
       },
     },
-    async ({ workspace_id, scope_id, session_id }) => {
-      try {
-        const scope = existingScope(ctx.clientFor(workspace_id), scope_id);
-        await scope.removeSession(session_id);
-        return textResult({ scope_id, removed: session_id });
-      } catch (e) {
-        return errorResult(errorMessage("Failed to remove session from scope", e));
-      }
-    },
+    async ({ workspace_id, scope_id, session_id }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const honcho = yield* d.honchoFor(workspace_id);
+          const scope = existingScope(honcho, scope_id);
+          yield* apiCall("remove session from scope", () =>
+            scope.removeSession(session_id),
+          );
+          return { scope_id, removed: session_id };
+        }),
+        deps,
+      ),
   );
 
   // ── get_scope_status ────────────────────────────────────────────────
   server.registerTool(
     "get_scope_status",
     {
-      annotations: {
-        title: "Get Scope Status",
-        readOnlyHint: true,
-      },
+      annotations: { title: "Get Scope Status", readOnlyHint: true },
       description: [
         "Get backfill progress for a scope, keyed by session ID.",
         "Each entry is pending, completed, or failed. Only sessions with a backfill enqueued appear, so an empty result means nothing is outstanding.",
         "Use this after add_sessions_to_scope to tell 'the scope hasn't caught up yet' apart from 'there is nothing to recall'.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         scope_id: z.string().describe("The scope to check."),
       },
     },
-    async ({ workspace_id, scope_id }) => {
-      try {
-        const scope = existingScope(ctx.clientFor(workspace_id), scope_id);
-        const status = await scope.status();
-        const entries = Object.entries(status.backfillStatus);
-        const counts = { pending: 0, completed: 0, failed: 0 };
-        const sessions: Record<string, { state: string; updated_at: string; docs_copied?: number }> = {};
-        for (const [sid, st] of entries) {
-          if (Object.hasOwn(counts, st.state)) {
-            counts[st.state] += 1;
+    async ({ workspace_id, scope_id }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const honcho = yield* d.honchoFor(workspace_id);
+          const scope = existingScope(honcho, scope_id);
+          const status = yield* apiCall("get scope status", () => scope.status());
+          const entries = Object.entries(status.backfillStatus);
+          const counts = { pending: 0, completed: 0, failed: 0 };
+          const sessions: Record<
+            string,
+            { state: string; updated_at: string; docs_copied?: number }
+          > = {};
+          for (const [sid, st] of entries) {
+            if (Object.hasOwn(counts, st.state)) {
+              counts[st.state] += 1;
+            }
+            sessions[sid] = { state: st.state, updated_at: st.updatedAt };
+            if (st.docsCopied !== undefined) sessions[sid].docs_copied = st.docsCopied;
           }
-          sessions[sid] = { state: st.state, updated_at: st.updatedAt };
-          if (st.docsCopied !== undefined) sessions[sid].docs_copied = st.docsCopied;
-        }
-        return textResult({ scope_id, ...counts, sessions });
-      } catch (e) {
-        return errorResult(errorMessage("Failed to get scope status", e));
-      }
-    },
+          return { scope_id, ...counts, sessions };
+        }),
+        deps,
+      ),
   );
 
   // ── get_scope_sessions ──────────────────────────────────────────────
   server.registerTool(
     "get_scope_sessions",
     {
-      annotations: {
-        title: "Get Scope Sessions",
-        readOnlyHint: true,
-      },
+      annotations: { title: "Get Scope Sessions", readOnlyHint: true },
       description: [
         "List the sessions that belong to a scope (paginated).",
         "Use this to see which conversations a recall boundary covers.",
         "Returns session IDs with pagination metadata.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         scope_id: z.string().describe("The scope to list sessions for."),
         page: pageSchema,
         size: sizeSchema,
       },
     },
-    async ({ workspace_id, scope_id, page: pageNum, size }) => {
-      try {
-        const scope = existingScope(ctx.clientFor(workspace_id), scope_id);
-        const page = await scope.sessions({ page: pageNum, size });
-        return textResult({
-          scope_id,
-          sessions: page.items.map((s) => ({ id: s.id })),
-          total: page.total,
-          page: page.page,
-          pages: page.pages,
-        });
-      } catch (e) {
-        return errorResult(errorMessage("Failed to list scope sessions", e));
-      }
-    },
+    async ({ workspace_id, scope_id, page: pageNum, size }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const honcho = yield* d.honchoFor(workspace_id);
+          const scope = existingScope(honcho, scope_id);
+          const page = yield* apiCall("get scope sessions", () =>
+            scope.sessions({ page: pageNum, size }),
+          );
+          return {
+            scope_id,
+            sessions: page.items.map((s) => ({ id: s.id })),
+            total: page.total,
+            page: page.page,
+            pages: page.pages,
+          };
+        }),
+        deps,
+      ),
   );
 }

@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { Effect } from "effect";
+import type { Conclusion } from "@honcho-ai/sdk";
 import {
   BadRequestError,
   HonchoError,
@@ -7,22 +9,26 @@ import {
   type WorkspaceResponse,
 } from "@honcho-ai/sdk";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { ToolContext } from "../types.js";
-import { resolveWorkspaceId } from "../config.js";
+import type { ToolDeps } from "../deps.js";
+import { ToolDepsService, apiCall, MISSING_WORKSPACE_MESSAGE } from "../honcho.js";
+import { runTool } from "../run.js";
 import {
-  textResult,
   errorResult,
-  errorMessage,
   formatMessages,
   workspaceIdSchema,
 } from "../types.js";
+import { MissingWorkspaceError } from "../errors.js";
 
-function withAdminKeyHint(prefix: string, e: unknown): string {
-  const message = e instanceof Error ? e.message : String(e);
+/** Admin ops (list/create workspace) need an admin key; hint on 401/403. */
+function failAdminHint(prefix: string, cause: unknown) {
+  const message = cause instanceof Error ? cause.message : String(cause);
   const denied =
-    e instanceof HonchoError && (e.status === 401 || e.status === 403);
-  if (!denied) return `${prefix}: ${message}`;
-  return `${prefix}: ${message}. This operation is only possible with an admin API key.`;
+    cause instanceof HonchoError && (cause.status === 401 || cause.status === 403);
+  return Effect.fail(
+    new Error(
+      `${prefix}: ${message}${denied ? ". This operation is only possible with an admin API key." : ""}`,
+    ),
+  );
 }
 
 function formatWorkspace(workspace: WorkspaceResponse) {
@@ -33,60 +39,51 @@ function formatWorkspace(workspace: WorkspaceResponse) {
   };
 }
 
-export function register(server: McpServer, ctx: ToolContext) {
+export function register(server: McpServer, deps: ToolDeps) {
   // ── inspect_workspace ───────────────────────────────────────────────
   server.registerTool(
     "inspect_workspace",
     {
-      annotations: {
-        title: "Inspect Workspace",
-        readOnlyHint: true,
-      },
+      annotations: { title: "Inspect Workspace", readOnlyHint: true },
       description: [
         "Inspect a workspace at a glance.",
         "Aggregates workspace metadata, configuration, peer IDs, and session IDs.",
         "Returns the first page of peers/sessions with total counts.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
       },
     },
-    async ({ workspace_id }) => {
-      try {
-        const honcho = ctx.clientFor(workspace_id);
-        const [metadata, configuration, peerPage, sessionPage] =
-          await Promise.all([
-            honcho.getMetadata(),
-            honcho.getConfiguration(),
-            honcho.peers(),
-            honcho.sessions(),
+    async ({ workspace_id }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const honcho = yield* d.honchoFor(workspace_id);
+          const [metadata, configuration, peerPage, sessionPage] = yield* Effect.all([
+            apiCall("get workspace metadata", () => honcho.getMetadata()),
+            apiCall("get workspace configuration", () => honcho.getConfiguration()),
+            apiCall("list workspace peers", () => honcho.peers()),
+            apiCall("list workspace sessions", () => honcho.sessions()),
           ]);
-
-        return textResult({
-          workspace_id: honcho.workspaceId,
-          metadata,
-          configuration,
-          peer_count: peerPage.total,
-          peers: peerPage.items.map((p) => ({ id: p.id })),
-          session_count: sessionPage.total,
-          sessions: sessionPage.items.map((s) => ({ id: s.id })),
-        });
-      } catch (e) {
-        return errorResult(
-          errorMessage("Failed to inspect workspace", e),
-        );
-      }
-    },
+          return {
+            workspace_id: honcho.workspaceId,
+            metadata,
+            configuration,
+            peer_count: peerPage.total,
+            peers: peerPage.items.map((p) => ({ id: p.id })),
+            session_count: sessionPage.total,
+            sessions: sessionPage.items.map((s) => ({ id: s.id })),
+          };
+        }),
+        deps,
+      ),
   );
 
   // ── list_workspaces ─────────────────────────────────────────────────
   server.registerTool(
     "list_workspaces",
     {
-      annotations: {
-        title: "List Workspaces",
-        readOnlyHint: true,
-      },
+      annotations: { title: "List Workspaces", readOnlyHint: true },
       description: [
         "List workspaces accessible to the current credentials (paginated).",
         "Skip this if the server already defaults a workspace via HONCHO_WORKSPACE_ID — omit workspace_id on other tools.",
@@ -109,35 +106,35 @@ export function register(server: McpServer, ctx: ToolContext) {
           .describe("Results per page (max 100)."),
       },
     },
-    async ({ page, size }) => {
-      try {
-        const result = await ctx.unscoped.http.post<
-          PageResponse<WorkspaceResponse>
-        >("/v3/workspaces/list", {
-          body: {},
-          query: { page, size },
-        });
-        return textResult({
-          workspaces: result.items.map(formatWorkspace),
-          total: result.total,
-          page: result.page,
-          pages: result.pages,
-        });
-      } catch (e) {
-        return errorResult(withAdminKeyHint("Failed to list workspaces", e));
-      }
-    },
+    async ({ page, size }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const result = yield* Effect.catch(
+            apiCall("list workspaces", () =>
+              d.unscoped.http.post<PageResponse<WorkspaceResponse>>(
+                "/v3/workspaces/list",
+                { body: {}, query: { page, size } },
+              ),
+            ),
+            (e) => failAdminHint("Failed to list workspaces", e.cause),
+          );
+          return {
+            workspaces: result.items.map(formatWorkspace),
+            total: result.total,
+            page: result.page,
+            pages: result.pages,
+          };
+        }),
+        deps,
+      ),
   );
 
   // ── create_workspace ────────────────────────────────────────────────
   server.registerTool(
     "create_workspace",
     {
-      annotations: {
-        title: "Create Workspace",
-        readOnlyHint: false,
-        destructiveHint: false,
-      },
+      annotations: { title: "Create Workspace", readOnlyHint: false, destructiveHint: false },
       description: [
         "Get or create a workspace with the given ID.",
         "Skip this if the server already defaults a workspace via HONCHO_WORKSPACE_ID — that pins the workspace without a create call.",
@@ -146,7 +143,7 @@ export function register(server: McpServer, ctx: ToolContext) {
         "Returns the workspace id, metadata, and created_at.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         metadata: z
           .looseObject({})
           .optional()
@@ -155,33 +152,35 @@ export function register(server: McpServer, ctx: ToolContext) {
           ),
       },
     },
-    async ({ workspace_id, metadata }) => {
-      try {
-        const id = resolveWorkspaceId(ctx.config, workspace_id);
-        const workspace = await ctx.unscoped.http.post<WorkspaceResponse>(
-          "/v3/workspaces",
-          {
-            body: {
-              id,
-              metadata,
-            },
-          },
-        );
-        return textResult(formatWorkspace(workspace));
-      } catch (e) {
-        return errorResult(withAdminKeyHint("Failed to create workspace", e));
-      }
-    },
+    async ({ workspace_id, metadata }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const id = workspace_id?.trim() || d.config.workspaceId?.trim();
+          if (!id) {
+            return yield* Effect.fail(
+              new MissingWorkspaceError({ message: MISSING_WORKSPACE_MESSAGE }),
+            );
+          }
+          const workspace = yield* Effect.catch(
+            apiCall("create workspace", () =>
+              d.unscoped.http.post<WorkspaceResponse>("/v3/workspaces", {
+                body: { id, metadata },
+              }),
+            ),
+            (e) => failAdminHint("Failed to create workspace", e.cause),
+          );
+          return formatWorkspace(workspace);
+        }),
+        deps,
+      ),
   );
 
   // ── search ────────────────────────────────────────────────────────
   server.registerTool(
     "search",
     {
-      annotations: {
-        title: "Search Workspace",
-        readOnlyHint: true,
-      },
+      annotations: { title: "Search Workspace", readOnlyHint: true },
       description: [
         "Semantic search across messages and, when peer_id is given, that peer's saved conclusions.",
         "Message scope is determined by which optional params are provided:",
@@ -193,7 +192,7 @@ export function register(server: McpServer, ctx: ToolContext) {
         "Returns {messages, conclusions}.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         query: z.string().describe("Search query."),
         peer_id: z
           .string()
@@ -247,77 +246,81 @@ export function register(server: McpServer, ctx: ToolContext) {
           "Search failed: `scope` and `session_id` are mutually exclusive — a scope already names a set of sessions.",
         );
       }
-      try {
-        const honcho = ctx.clientFor(workspace_id);
-        const peer = peer_id ? await honcho.peer(peer_id) : null;
-        const messageOptions = {
-          filters: message_filters,
-          limit: message_limit,
-        };
+      return runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const honcho = yield* d.honchoFor(workspace_id);
+          const peer = peer_id
+            ? yield* apiCall("get peer", () => honcho.peer(peer_id))
+            : null;
+          const messageOptions = {
+            filters: message_filters,
+            limit: message_limit,
+          };
 
-        const searchMessages = async () => {
+          let messages;
           if (scope !== undefined) {
             // The scope-aware route is workspace-level; a peer narrows it via
             // the message filter rather than the peer-level search route.
-            return honcho.search(query, {
-              ...messageOptions,
-              scope,
-              filters: peer_id
-                ? { ...message_filters, peer_id }
-                : message_filters,
-            });
-          }
-          if (session_id) {
-            const session = await honcho.session(session_id);
-            return session.search(query, messageOptions);
-          }
-          if (peer) {
-            return peer.search(query, messageOptions);
-          }
-          return honcho.search(query, messageOptions);
-        };
-
-        // Conclusion search needs an (observer, observed) pair, so it only
-        // runs when peer_id is given.
-        const searchConclusions = async () => {
-          if (!peer) {
-            return [];
-          }
-          try {
-            return await peer.conclusions.query(
-              query,
-              conclusion_top_k,
-              undefined,
-              conclusion_filters,
+            messages = yield* apiCall("workspace search", () =>
+              honcho.search(query, {
+                ...messageOptions,
+                scope,
+                filters: peer_id
+                  ? { ...message_filters, peer_id }
+                  : message_filters,
+              }),
             );
-          } catch (e) {
-            if (
-              conclusion_filters &&
-              (e instanceof BadRequestError ||
-                e instanceof UnprocessableEntityError)
-            ) {
-              throw e;
-            }
-            return [];
+          } else if (session_id) {
+            const session = yield* apiCall("get session", () =>
+              honcho.session(session_id),
+            );
+            messages = yield* apiCall("session search", () =>
+              session.search(query, messageOptions),
+            );
+          } else if (peer) {
+            messages = yield* apiCall("peer search", () =>
+              peer.search(query, messageOptions),
+            );
+          } else {
+            messages = yield* apiCall("workspace search", () =>
+              honcho.search(query, messageOptions),
+            );
           }
-        };
 
-        const [messages, conclusions] = await Promise.all([
-          searchMessages(),
-          searchConclusions(),
-        ]);
-        return textResult({
-          messages: formatMessages(messages),
-          conclusions: conclusions.map((c) => ({
-            id: c.id,
-            content: c.content,
-            level: c.level,
-            created_at: c.createdAt,
-          })),
-        });
-      } catch (e) {
-        return errorResult(errorMessage("Search failed", e));
-      }
+          // Conclusion search needs an (observer, observed) pair, so it only
+          // runs when peer_id is given.
+          const conclusions = peer
+            ? yield* Effect.catch(
+                apiCall("query conclusions", () =>
+                  peer.conclusions.query(
+                    query,
+                    conclusion_top_k,
+                    undefined,
+                    conclusion_filters,
+                  ),
+                ),
+                (e) =>
+                  conclusion_filters &&
+                  (e.cause instanceof BadRequestError ||
+                    e.cause instanceof UnprocessableEntityError)
+                    ? Effect.fail(e)
+                    : Effect.succeed([] as Conclusion[]),
+              )
+            : ([] as Conclusion[]);
+
+          return {
+            messages: formatMessages(messages),
+            conclusions: conclusions.map((c) => ({
+              id: c.id,
+              content: c.content,
+              level: c.level,
+              created_at: c.createdAt,
+            })),
+          };
+        }),
+        deps,
+      );
     },
   );
 
@@ -325,10 +328,7 @@ export function register(server: McpServer, ctx: ToolContext) {
   server.registerTool(
     "workspace_chat",
     {
-      annotations: {
-        title: "Ask About a Workspace",
-        readOnlyHint: true,
-      },
+      annotations: { title: "Ask About a Workspace", readOnlyHint: true },
       description: [
         "Ask a natural-language question about the whole workspace and get an answer from Honcho's reasoning system.",
         "Reasons across ALL peers and their conclusions — use for cross-peer analysis, common themes, or questions not tied to one peer.",
@@ -337,7 +337,7 @@ export function register(server: McpServer, ctx: ToolContext) {
         "With `include_evidence`, returns an object instead: the answer plus what the agent read to produce it.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         query: z.string().describe("Natural-language question."),
         session_id: z
           .string()
@@ -370,37 +370,36 @@ export function register(server: McpServer, ctx: ToolContext) {
       scope,
       reasoning_level,
       include_evidence,
-    }) => {
-      try {
-        const client = ctx.clientFor(workspace_id);
-        const options = {
-          session: session_id,
-          scope,
-          reasoningLevel: reasoning_level ?? ctx.config.reasoningLevel,
-        };
-        if (!include_evidence) {
-          const result = await client.chat(query, options);
-          return textResult(result ?? "None");
-        }
-        const { content, evidence } = await client.chat(query, {
-          ...options,
-          includeEvidence: true,
-        });
-        return textResult({ content: content ?? "None", evidence });
-      } catch (e) {
-        return errorResult(errorMessage("Workspace chat failed", e));
-      }
-    },
+    }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const honcho = yield* d.honchoFor(workspace_id);
+          const options = {
+            session: session_id,
+            scope,
+            reasoningLevel: reasoning_level ?? d.config.reasoningLevel,
+          };
+          if (!include_evidence) {
+            const result = yield* apiCall("workspace chat", () =>
+              honcho.chat(query, options),
+            );
+            return result ?? "None";
+          }
+          const { content, evidence } = yield* apiCall("workspace chat", () =>
+            honcho.chat(query, { ...options, includeEvidence: true }),
+          );
+          return { content: content ?? "None", evidence };
+        }),
+        deps,
+      ),
   );
 
   // ── get_metadata ──────────────────────────────────────────────────
   server.registerTool(
     "get_metadata",
     {
-      annotations: {
-        title: "Get Metadata",
-        readOnlyHint: true,
-      },
+      annotations: { title: "Get Metadata", readOnlyHint: true },
       description: [
         "Get metadata for a resource. Scope is determined by which optional params are provided:",
         "- No scope params: get workspace metadata.",
@@ -408,7 +407,7 @@ export function register(server: McpServer, ctx: ToolContext) {
         "- session_id only: get session metadata.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         peer_id: z
           .string()
           .optional()
@@ -419,35 +418,36 @@ export function register(server: McpServer, ctx: ToolContext) {
           .describe("Optional: get metadata for this session."),
       },
     },
-    async ({ workspace_id, peer_id, session_id }) => {
-      try {
-        const honcho = ctx.clientFor(workspace_id);
-        let metadata;
-        if (session_id) {
-          const session = await honcho.session(session_id);
-          metadata = await session.getMetadata();
-        } else if (peer_id) {
-          const peer = await honcho.peer(peer_id);
-          metadata = await peer.getMetadata();
-        } else {
-          metadata = await honcho.getMetadata();
-        }
-        return textResult(metadata);
-      } catch (e) {
-        return errorResult(errorMessage("Failed to get metadata", e));
-      }
-    },
+    async ({ workspace_id, peer_id, session_id }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const honcho = yield* d.honchoFor(workspace_id);
+          if (session_id) {
+            const session = yield* apiCall("get session", () =>
+              honcho.session(session_id),
+            );
+            return yield* apiCall("get session metadata", () =>
+              session.getMetadata(),
+            );
+          }
+          if (peer_id) {
+            const peer = yield* apiCall("get peer", () => honcho.peer(peer_id));
+            return yield* apiCall("get peer metadata", () => peer.getMetadata());
+          }
+          return yield* apiCall("get workspace metadata", () =>
+            honcho.getMetadata(),
+          );
+        }),
+        deps,
+      ),
   );
 
   // ── set_metadata ──────────────────────────────────────────────────
   server.registerTool(
     "set_metadata",
     {
-      annotations: {
-        title: "Set Metadata",
-        readOnlyHint: false,
-        destructiveHint: true,
-      },
+      annotations: { title: "Set Metadata", readOnlyHint: false, destructiveHint: true },
       description: [
         "Set metadata for a resource. Overwrites existing metadata.",
         "Scope is determined by which optional params are provided:",
@@ -456,7 +456,7 @@ export function register(server: McpServer, ctx: ToolContext) {
         "- session_id only: set session metadata.",
       ].join("\n"),
       inputSchema: {
-        workspace_id: workspaceIdSchema(ctx),
+        workspace_id: workspaceIdSchema(deps),
         metadata: z
           .looseObject({})
           .describe("Key-value pairs to set as metadata."),
@@ -470,24 +470,31 @@ export function register(server: McpServer, ctx: ToolContext) {
           .describe("Optional: set metadata for this session."),
       },
     },
-    async ({ workspace_id, metadata, peer_id, session_id }) => {
-      try {
-        const honcho = ctx.clientFor(workspace_id);
-        if (session_id) {
-          const session = await honcho.session(session_id);
-          await session.setMetadata(metadata);
-          return textResult("Session metadata set successfully");
-        } else if (peer_id) {
-          const peer = await honcho.peer(peer_id);
-          await peer.setMetadata(metadata);
-          return textResult("Peer metadata set successfully");
-        } else {
-          await honcho.setMetadata(metadata);
-          return textResult("Workspace metadata set successfully");
-        }
-      } catch (e) {
-        return errorResult(errorMessage("Failed to set metadata", e));
-      }
-    },
+    async ({ workspace_id, metadata, peer_id, session_id }) =>
+      runTool(
+        Effect.gen(function* () {
+          const d = yield* ToolDepsService;
+          const honcho = yield* d.honchoFor(workspace_id);
+          if (session_id) {
+            const session = yield* apiCall("get session", () =>
+              honcho.session(session_id),
+            );
+            yield* apiCall("set session metadata", () =>
+              session.setMetadata(metadata),
+            );
+            return "Session metadata set successfully";
+          }
+          if (peer_id) {
+            const peer = yield* apiCall("get peer", () => honcho.peer(peer_id));
+            yield* apiCall("set peer metadata", () => peer.setMetadata(metadata));
+            return "Peer metadata set successfully";
+          }
+          yield* apiCall("set workspace metadata", () =>
+            honcho.setMetadata(metadata),
+          );
+          return "Workspace metadata set successfully";
+        }),
+        deps,
+      ),
   );
 }

@@ -107,20 +107,26 @@ export function createClient(
 
 /**
  * Client factory with a per-workspace cache.
- * Throws when no workspace can be resolved (config default + argument).
+ * `resolve` throws when no workspace can be resolved
+ * (config default + argument).
  */
 export function createClientFactory(
   config: HonchoConfig,
-): (workspaceId?: string) => Honcho {
+): {
+  resolve: (workspaceId?: string) => string;
+  get: (workspaceId: string) => Honcho;
+} {
   const cache = new Map<string, Honcho>();
-  return (workspaceId?: string) => {
-    const id = resolveWorkspaceId(config, workspaceId);
-    let client = cache.get(id);
-    if (!client) {
-      client = createClient(config, id);
-      cache.set(id, client);
-    }
-    return client;
+  return {
+    resolve: (workspaceId?: string) => resolveWorkspaceId(config, workspaceId),
+    get: (workspaceId: string) => {
+      let client = cache.get(workspaceId);
+      if (!client) {
+        client = createClient(config, workspaceId);
+        cache.set(workspaceId, client);
+      }
+      return client;
+    },
   };
 }
 
